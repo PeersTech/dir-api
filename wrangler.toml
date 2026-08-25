@@ -2,12 +2,10 @@ name = "dir-api"
 main = "src/worker.ts"
 compatibility_date = "2024-09-23"
 
-# D1 database: create once, paste the id here
-#   npx wrangler d1 create dir-api
 [[d1_databases]]
 binding = "DB"
 database_name = "dir-api"
-database_id = "REPLACE_ME"
+database_id = "eb00389d-73c3-4775-a527-9e1d9dc4c2e4"
 
 # Prune expired nonces + long-dead nodes twice an hour
 [triggers]
@@ -16,7 +14,9 @@ crons = ["*/30 * * * *"]
 # Custom domain — peers.dpdns.org IS a Cloudflare zone, so this attaches
 # with zero extra DNS work. After first deploy run once:
 #   npx wrangler deploy   (then confirm the domain in dashboard → Workers → dir-api → Domains)
-routes = [{ pattern = "directory.peers.dpdns.org", custom_domain = true }]
+[[routes]]
+pattern = "directory.peers.dpdns.org"
+custom_domain = true
 
 [observability]
 enabled = true
