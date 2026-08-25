@@ -1,0 +1,24 @@
+{
+  "name": "dir-api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Peers node registry & discovery API — Cloudflare Worker + Hono + D1",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@noble/curves": "^2.3.0",
+    "@scure/base": "^2.3.0",
+    "hono": "^4.6.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241022.0",
+    "typescript": "^5.6.0",
+    "vitest": "^3.0.0",
+    "wrangler": "^3.90.0"
+  }
+}
