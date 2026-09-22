@@ -1,11 +1,13 @@
 import { Hono, type Context } from 'hono';
 import {
+  normalizeMultiaddrs,
   pubkeyFromPeerId,
-  validMultiaddr,
+  splitMultiaddrs,
+  validMultiaddrs,
   verifyHeartbeat,
   verifyRegister,
 } from './crypto.js';
-import type { RegistryStore } from './types.js';
+import type { RegistryStore, Tier } from './types.js';
 
 /** Tunables, injected so tests can shrink time. */
 export interface AppOptions {
@@ -49,22 +51,25 @@ export function createApp(store: RegistryStore, opts: AppOptions = {}): Hono {
   app.post('/v1/register', async (c) => {
     const body = (await c.req.json().catch(() => null)) as null | Record<string, unknown>;
     if (!body) return json400(c, 'body must be json');
-    const { peerId, nonce, sig, multiaddr } = body as Record<string, string>;
+    const { peerId, nonce, sig, multiaddrs } = body as Record<string, string>;
     if (!peerId || !nonce || !sig) return json400(c, 'peerId, nonce, sig required');
     if (!verifyRegister(peerId, String(nonce), String(sig))) {
       return json400(c, 'signature invalid');
     }
+    // Fail fast on a bad tier before consuming the single-use nonce.
+    const regTier = parseTier(body.tier);
+    if (!regTier.ok) return json400(c, 'tier must be citizen, node, or off');
     if (!(await store.takeNonce(peerId, String(nonce), now()))) {
       return json400(c, 'nonce unknown, expired or already used');
     }
-    if (!validMultiaddr(multiaddr, peerId)) {
-      return json400(c, 'multiaddr must end in /p2p/<same peer id>');
+    if (!validMultiaddrs(multiaddrs, peerId)) {
+      return json400(c, 'multiaddrs must be comma-separated addrs ending in /p2p/<same peer id>');
     }
     await store.upsertNode({
       peerId,
-      multiaddr,
+      multiaddrs: normalizeMultiaddrs(multiaddrs) ?? '',
       region: strOrNull(body.region),
-      tier: strOrNull(body.tier) ?? 'node',
+      tier: regTier.tier ?? 'node',
       lastSeen: now(),
     });
     return c.json({ ok: true, heartbeatAfterSec: interval });
@@ -73,7 +78,7 @@ export function createApp(store: RegistryStore, opts: AppOptions = {}): Hono {
   app.post('/v1/heartbeat', async (c) => {
     const body = (await c.req.json().catch(() => null)) as null | Record<string, unknown>;
     if (!body) return json400(c, 'body must be json');
-    const { peerId, ts, sig, multiaddr, region } = body as Record<string, unknown>;
+    const { peerId, ts, sig, multiaddrs, region } = body as Record<string, unknown>;
     if (
       !verifyHeartbeat(
         String(peerId),
@@ -85,27 +90,28 @@ export function createApp(store: RegistryStore, opts: AppOptions = {}): Hono {
     ) {
       return json400(c, 'signature invalid or clock too far off');
     }
+    const hbTier = parseTier(body.tier);
+    if (!hbTier.ok) return json400(c, 'tier must be citizen, node, or off');
     const existing = await store.getNode(String(peerId));
-    if (!existing && !validMultiaddr(multiaddr, String(peerId))) {
+    if (!existing && !validMultiaddrs(multiaddrs, String(peerId))) {
       // Unknown nodes may bootstrap straight into a heartbeat, but then we
-      // need a bound address — otherwise they'd be unlistable.
-      return json400(c, 'unknown node: multiaddr ending in /p2p/<id> required');
+      // need a bound address. Otherwise they would be unlistable.
+      return json400(c, 'unknown node: multiaddrs ending in /p2p/<id> required');
     }
 
     // Write-skip: inside half the told cadence a heartbeat is an ack, not
-    // a write — this is what keeps 10k nodes inside D1 free limits.
+    // a write. This is what keeps 10k nodes inside D1 free limits.
     if (existing && now() - existing.lastSeen < (opts.freshMs ?? DEFAULTS.freshMs)) {
       return c.json({ ok: true, skipped: true, heartbeatAfterSec: interval });
     }
 
+    const freshAddrs =
+      validMultiaddrs(multiaddrs, String(peerId)) ? (normalizeMultiaddrs(multiaddrs) as string) : null;
     await store.upsertNode({
       peerId: String(peerId),
-      multiaddr:
-        (validMultiaddr(multiaddr, String(peerId)) ? (multiaddr as string) : undefined) ??
-        existing?.multiaddr ??
-        '',
+      multiaddrs: freshAddrs ?? existing?.multiaddrs ?? '',
       region: strOrNull(region) ?? existing?.region ?? null,
-      tier: existing?.tier ?? 'node',
+      tier: hbTier.tier ?? existing?.tier ?? 'node',
       lastSeen: now(),
     });
     return c.json({ ok: true, heartbeatAfterSec: interval });
@@ -121,12 +127,16 @@ export function createApp(store: RegistryStore, opts: AppOptions = {}): Hono {
 
     const nodes = await store.listFresh(now(), DEFAULTS.freshMs * 2, limit, cursor);
     const last = nodes.at(-1);
+    const peersNodes = nodes
+      .flatMap((n) => splitMultiaddrs(n.multiaddrs))
+      .join(',');
     return c.json({
       ok: true,
       protocol: 1,
       heartbeatAfterSec: interval,
+      peersNodes,
       nodes: nodes.map((n) => ({
-        multiaddr: n.multiaddr,
+        multiaddrs: n.multiaddrs,
         peerId: n.peerId,
         lastSeen: n.lastSeen,
         region: n.region,
@@ -140,7 +150,7 @@ export function createApp(store: RegistryStore, opts: AppOptions = {}): Hono {
   return app;
 }
 
-/** Opaque composite cursor: `<lastSeen>:<peerId>` — ties on timestamp are
+/** Opaque composite cursor: `<lastSeen>:<peerId>`. Ties on timestamp are
  * broken by peer id so pagination is total. */
 function decodeCursor(raw: string | undefined): { lastSeen: number; peerId: string } | undefined {
   if (!raw) return undefined;
@@ -158,4 +168,12 @@ function json400(c: Context, error: string) {
 
 function strOrNull(v: unknown): string | null {
   return typeof v === 'string' && v.length > 0 && v.length <= 32 ? v : null;
+}
+
+/** Strict tier parsing for Peers relay tiers: citizen, node, or off.
+ * Absent means "keep the default". Anything else is rejected. */
+function parseTier(v: unknown): { ok: true; tier?: Tier } | { ok: false } {
+  if (v === undefined || v === null || v === '') return { ok: true };
+  if (v === 'citizen' || v === 'node' || v === 'off') return { ok: true, tier: v };
+  return { ok: false };
 }

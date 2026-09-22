@@ -1,11 +1,15 @@
 /** Registry data shapes + the storage seam. Tests inject an in-memory
- * store; production binds D1 — same contract either way. */
+ * store; production binds D1. Same contract either way. */
+
+/** Relay tier values used by the Peers app: citizen, node, or off. */
+export type Tier = 'citizen' | 'node' | 'off';
 
 export interface NodeRow {
   peerId: string;
-  multiaddr: string;
+  /** Comma-separated full multiaddrs, PEERS_NODES format. */
+  multiaddrs: string;
   region: string | null;
-  tier: string;
+  tier: Tier;
   lastSeen: number;
 }
 

@@ -63,15 +63,33 @@ export function verifyHeartbeat(
   }
 }
 
-/** The multiaddr must terminate at the SAME peer id that signed — this is
- * what makes address poisoning infeasible. */
-export function validMultiaddr(addr: unknown, peerId: string): addr is string {
-  return (
-    typeof addr === 'string' &&
-    addr.startsWith('/') &&
-    addr.includes('/p2p/') &&
-    addr.endsWith(`/p2p/${peerId}`)
+/** Every multiaddr must terminate at the SAME peer id that signed. This is
+ * what makes address poisoning infeasible. Accepts a comma-separated list
+ * in PEERS_NODES format. */
+export function validMultiaddrs(addrs: unknown, peerId: string): addrs is string {
+  if (typeof addrs !== 'string' || addrs.length === 0) return false;
+  const parts = splitMultiaddrs(addrs);
+  if (parts.length === 0) return false;
+  return parts.every(
+    (a) => a.startsWith('/') && a.includes('/p2p/') && a.endsWith(`/p2p/${peerId}`),
   );
+}
+
+/** Splits a PEERS_NODES style comma-separated multiaddr list and trims
+ * each entry. Empty entries are dropped. */
+export function splitMultiaddrs(addrs: string): string[] {
+  return addrs
+    .split(',')
+    .map((a) => a.trim())
+    .filter((a) => a.length > 0);
+}
+
+/** Normalizes a multiaddr list to trimmed, comma-joined form, or null when
+ * the input is not a usable string. */
+export function normalizeMultiaddrs(addrs: unknown): string | null {
+  if (typeof addrs !== 'string') return null;
+  const parts = splitMultiaddrs(addrs);
+  return parts.length > 0 ? parts.join(',') : null;
 }
 
 function fromB64(s: string): Uint8Array {

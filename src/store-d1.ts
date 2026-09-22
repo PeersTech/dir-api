@@ -45,11 +45,11 @@ export class D1Store implements RegistryStore {
   async upsertNode(row: NodeRow): Promise<void> {
     await this.db
       .prepare(
-        'INSERT INTO nodes (peer_id, multiaddr, region, tier, last_seen) VALUES (?, ?, ?, ?, ?) ' +
-          'ON CONFLICT(peer_id) DO UPDATE SET multiaddr=excluded.multiaddr, region=excluded.region, ' +
+        'INSERT INTO nodes (peer_id, multiaddrs, region, tier, last_seen) VALUES (?, ?, ?, ?, ?) ' +
+          'ON CONFLICT(peer_id) DO UPDATE SET multiaddrs=excluded.multiaddrs, region=excluded.region, ' +
           'tier=excluded.tier, last_seen=excluded.last_seen',
       )
-      .bind(row.peerId, row.multiaddr, row.region, row.tier, row.lastSeen)
+      .bind(row.peerId, row.multiaddrs, row.region, row.tier, row.lastSeen)
       .run();
   }
 
@@ -98,12 +98,22 @@ export class D1Store implements RegistryStore {
 
 interface Row {
   peer_id: string;
-  multiaddr: string;
+  multiaddrs: string;
   region: string | null;
   tier: string;
   last_seen: number;
 }
 
 function fromRow(r: Row): NodeRow {
-  return { peerId: r.peer_id, multiaddr: r.multiaddr, region: r.region, tier: r.tier, lastSeen: r.last_seen };
+  return {
+    peerId: r.peer_id,
+    multiaddrs: r.multiaddrs,
+    region: r.region,
+    tier: normalizeTier(r.tier),
+    lastSeen: r.last_seen,
+  };
+}
+
+function normalizeTier(t: string): NodeRow['tier'] {
+  return t === 'citizen' || t === 'off' ? t : 'node';
 }

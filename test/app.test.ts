@@ -104,7 +104,7 @@ function toB58(b: Uint8Array): string {
 
 async function register(peer: ReturnType<typeof makePeer>, addr?: string): Promise<Record<string, unknown>> {
   const ch = await json(await app.request(`/v1/challenge?peerId=${peer.peerId}`));
-  const multiaddr =
+  const multiaddrs =
     addr ?? `/ip4/203.0.113.7/tcp/4001/p2p/${peer.peerId}`;
   return json(
     await app.request('/v1/register', {
@@ -113,7 +113,7 @@ async function register(peer: ReturnType<typeof makePeer>, addr?: string): Promi
         peerId: peer.peerId,
         nonce: ch.nonce,
         sig: peer.sign(`peers-directory:v1:register:${peer.peerId}:${ch.nonce}`),
-        multiaddr,
+        multiaddrs,
       }),
     }),
   );
@@ -141,7 +141,7 @@ describe('directory flow', () => {
           peerId: alice.peerId,
           nonce: ch.nonce,
           sig: mallory.sign(`peers-directory:v1:register:${alice.peerId}:${ch.nonce}`),
-          multiaddr: `/ip4/10.9.9.9/tcp/1/p2p/${alice.peerId}`,
+          multiaddrs: `/ip4/10.9.9.9/tcp/1/p2p/${alice.peerId}`,
         }),
       }),
     );
@@ -160,7 +160,7 @@ describe('directory flow', () => {
       peerId: p.peerId,
       nonce: ch.nonce,
       sig: p.sign(`peers-directory:v1:register:${p.peerId}:${ch.nonce}`),
-      multiaddr: `/ip4/203.0.113.7/tcp/4001/p2p/${p.peerId}`,
+      multiaddrs: `/ip4/203.0.113.7/tcp/4001/p2p/${p.peerId}`,
     });
     expect((await json(await app.request('/v1/register', { method: 'POST', body }))).ok).toBe(true);
     const replay = await json(await app.request('/v1/register', { method: 'POST', body }));
@@ -172,6 +172,95 @@ describe('directory flow', () => {
     const other = makePeer();
     const res = await register(owner, `/ip4/203.0.113.9/tcp/4001/p2p/${other.peerId}`);
     expect(res.ok).toBe(false);
+  });
+
+  it('accepts comma-separated multiaddrs and emits peersNodes for PEERS_NODES', async () => {
+    const p = makePeer();
+    const a1 = `/ip4/203.0.113.7/tcp/4001/p2p/${p.peerId}`;
+    const a2 = `/ip4/203.0.113.8/tcp/4001/p2p/${p.peerId}`;
+    const res = await register(p, `${a1},${a2}`);
+    expect(res.ok).toBe(true);
+
+    const list = await json(await app.request('/v1/nodes?limit=500'));
+    const entry = (list.nodes as { peerId: string; multiaddrs: string; tier: string }[]).find(
+      (n) => n.peerId === p.peerId,
+    );
+    expect(entry).toBeDefined();
+    expect(entry?.multiaddrs).toBe(`${a1},${a2}`);
+    expect(entry?.tier).toBe('node');
+    expect(typeof list.peersNodes).toBe('string');
+    expect((list.peersNodes as string).split(',')).toEqual(expect.arrayContaining([a1, a2]));
+    // Every entry is a full multiaddr with a peer id suffix, so the
+    // string is directly usable as a PEERS_NODES value.
+    for (const part of (list.peersNodes as string).split(',')) {
+      expect(part).toContain('/p2p/');
+    }
+  });
+
+  it('rejects a multiaddr list that mixes in another peer id', async () => {
+    const owner = makePeer();
+    const other = makePeer();
+    const res = await register(
+      owner,
+      `/ip4/203.0.113.7/tcp/4001/p2p/${owner.peerId},/ip4/203.0.113.7/tcp/4002/p2p/${other.peerId}`,
+    );
+    expect(res.ok).toBe(false);
+  });
+
+  it('maps tier to citizen, node, or off and defaults to node', async () => {
+    const p = makePeer();
+    const ch = await json(await app.request(`/v1/challenge?peerId=${p.peerId}`));
+    const res = await json(
+      await app.request('/v1/register', {
+        method: 'POST',
+        body: JSON.stringify({
+          peerId: p.peerId,
+          nonce: ch.nonce,
+          sig: p.sign(`peers-directory:v1:register:${p.peerId}:${ch.nonce}`),
+          multiaddrs: `/ip4/203.0.113.7/tcp/4001/p2p/${p.peerId}`,
+          tier: 'citizen',
+        }),
+      }),
+    );
+    expect(res.ok).toBe(true);
+
+    const list = await json(await app.request('/v1/nodes?limit=500'));
+    const entry = (list.nodes as { peerId: string; tier: string }[]).find((n) => n.peerId === p.peerId);
+    expect(entry?.tier).toBe('citizen');
+  });
+
+  it('rejects unknown tier values with 400 on register and heartbeat', async () => {
+    const p = makePeer();
+    const ch = await json(await app.request(`/v1/challenge?peerId=${p.peerId}`));
+    const badRegister = await json(
+      await app.request('/v1/register', {
+        method: 'POST',
+        body: JSON.stringify({
+          peerId: p.peerId,
+          nonce: ch.nonce,
+          sig: p.sign(`peers-directory:v1:register:${p.peerId}:${ch.nonce}`),
+          multiaddrs: `/ip4/203.0.113.7/tcp/4001/p2p/${p.peerId}`,
+          tier: 'super',
+        }),
+      }),
+    );
+    expect(badRegister.ok).toBe(false);
+
+    const q = makePeer();
+    await register(q);
+    advance(16 * 60_000); // past freshness window so the heartbeat writes
+    const badHeartbeat = await json(
+      await app.request('/v1/heartbeat', {
+        method: 'POST',
+        body: JSON.stringify({
+          peerId: q.peerId,
+          ts: clock(),
+          sig: q.sign(`peers-directory:v1:heartbeat:${q.peerId}:${clock()}`),
+          tier: 'super',
+        }),
+      }),
+    );
+    expect(badHeartbeat.ok).toBe(false);
   });
 
   it('heartbeats keep the node fresh and skip redundant writes', async () => {
