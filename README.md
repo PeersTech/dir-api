@@ -46,7 +46,8 @@ Each node row has:
 The list response includes both shapes:
 
 - `nodes`: structured array of node records with `multiaddrs`, `peerId`,
-  `lastSeen`, `region`, and `tier`.
+  `lastSeen`, `region`, and `tier`. Records with `tier: "off"` are omitted
+  because they do not forward traffic.
 - `peersNodes`: all `multiaddrs` from the page joined with commas. This
   string can be dropped straight into the Peers `PEERS_NODES` env var.
   Split it on commas to write a `nodes.json` array instead.

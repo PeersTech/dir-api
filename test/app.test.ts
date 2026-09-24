@@ -43,7 +43,7 @@ class MemoryStore implements RegistryStore {
     cursor?: { lastSeen: number; peerId: string },
   ) {
     return [...this.nodes.values()]
-      .filter((n) => n.lastSeen > now - freshMs)
+      .filter((n) => n.lastSeen > now - freshMs && n.tier !== 'off')
       .filter((n) => {
         if (!cursor) return true;
         // Composite keyset: strictly after the cursor position.

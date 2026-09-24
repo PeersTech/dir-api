@@ -81,12 +81,12 @@ export class D1Store implements RegistryStore {
     const rows =
       cursor === undefined
         ? await this.db
-            .prepare('SELECT * FROM nodes WHERE last_seen > ? ORDER BY last_seen DESC, peer_id DESC LIMIT ?')
+            .prepare('SELECT * FROM nodes WHERE last_seen > ? AND tier != \'off\' ORDER BY last_seen DESC, peer_id DESC LIMIT ?')
             .bind(freshAfter, limit)
             .all<Row>()
         : await this.db
             .prepare(
-              'SELECT * FROM nodes WHERE last_seen > ? AND ' +
+              'SELECT * FROM nodes WHERE last_seen > ? AND tier != \'off\' AND ' +
                 '(last_seen < ? OR (last_seen = ? AND peer_id < ?)) ' +
                 'ORDER BY last_seen DESC, peer_id DESC LIMIT ?',
             )
