@@ -14,8 +14,9 @@ export interface NodeRow {
 }
 
 export interface RegistryStore {
-  /** Single-use challenge nonce; expires silently. */
-  putNonce(peerId: string, nonce: string, expiresAt: number): Promise<void>;
+  /** Single-use challenge nonce; returns the nonce that is active for the
+   * peer, preserving an unexpired challenge instead of invalidating it. */
+  putNonce(peerId: string, nonce: string, expiresAt: number, now: number): Promise<string>;
   /** Atomically consumes the nonce; false when missing/expired/used. */
   takeNonce(peerId: string, nonce: string, now: number): Promise<boolean>;
   upsertNode(row: NodeRow): Promise<void>;

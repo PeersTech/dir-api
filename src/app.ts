@@ -51,8 +51,8 @@ export function createApp(store: RegistryStore, opts: AppOptions = {}): Hono {
       return json400(c, interval, 'malformed peer id');
     }
     const nonce = crypto.randomUUID().replaceAll('-', '');
-    await store.putNonce(peerId, nonce, now() + 5 * 60_000);
-    return c.json({ ok: true, protocol: 1, heartbeatAfterSec: interval, nonce, expiresInSec: 300 });
+    const activeNonce = await store.putNonce(peerId, nonce, now() + 5 * 60_000, now());
+    return c.json({ ok: true, protocol: 1, heartbeatAfterSec: interval, nonce: activeNonce, expiresInSec: 300 });
   });
 
   app.post('/v1/register', async (c) => {

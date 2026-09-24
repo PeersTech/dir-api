@@ -17,8 +17,11 @@ class MemoryStore implements RegistryStore {
   nodes = new Map<string, NodeRow>();
   nonces = new Map<string, { nonce: string; expiresAt: number }>();
 
-  async putNonce(p: string, n: string, exp: number) {
+  async putNonce(p: string, n: string, exp: number, now: number) {
+    const existing = this.nonces.get(p);
+    if (existing && existing.expiresAt > now) return existing.nonce;
     this.nonces.set(p, { nonce: n, expiresAt: exp });
+    return n;
   }
   async takeNonce(p: string, n: string, now: number) {
     const e = this.nonces.get(p);
@@ -151,6 +154,13 @@ describe('directory flow', () => {
   it('rejects malformed peer ids outright', async () => {
     const res = await json(await app.request('/v1/challenge?peerId=not-a-peer-id'));
     expect(res.ok).toBe(false);
+  });
+
+  it('does not let a new challenge invalidate an active one', async () => {
+    const p = makePeer();
+    const first = await json(await app.request(`/v1/challenge?peerId=${p.peerId}`));
+    const second = await json(await app.request(`/v1/challenge?peerId=${p.peerId}`));
+    expect(second.nonce).toBe(first.nonce);
   });
 
   it('nonces are single-use (replay fails)', async () => {

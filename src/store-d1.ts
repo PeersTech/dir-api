@@ -22,14 +22,24 @@ export interface D1Like {
 export class D1Store implements RegistryStore {
   constructor(private readonly db: D1Like) {}
 
-  async putNonce(peerId: string, nonce: string, expiresAt: number): Promise<void> {
-    await this.db
+  async putNonce(peerId: string, nonce: string, expiresAt: number, now: number): Promise<string> {
+    const inserted = await this.db
       .prepare(
         'INSERT INTO nonces (peer_id, nonce, expires_at) VALUES (?, ?, ?) ' +
-          'ON CONFLICT(peer_id) DO UPDATE SET nonce=excluded.nonce, expires_at=excluded.expires_at',
+          'ON CONFLICT(peer_id) DO UPDATE SET nonce=excluded.nonce, expires_at=excluded.expires_at ' +
+          'WHERE nonces.expires_at <= ? RETURNING nonce',
       )
-      .bind(peerId, nonce, expiresAt)
-      .run();
+      .bind(peerId, nonce, expiresAt, now)
+      .first<{ nonce: string }>();
+    if (inserted?.nonce) return inserted.nonce;
+
+    // A live challenge belongs to the peer that requested it. Do not replace
+    // it merely because somebody requested another challenge for that ID.
+    const existing = await this.db
+      .prepare('SELECT nonce FROM nonces WHERE peer_id = ? AND expires_at > ?')
+      .bind(peerId, now)
+      .first<{ nonce: string }>();
+    return existing?.nonce ?? nonce;
   }
 
   /** Atomic consume: the DELETE ... RETURNING row only when it exists and
