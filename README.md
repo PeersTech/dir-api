@@ -25,8 +25,9 @@ domain. The zone peers.dpdns.org is on Cloudflare).
 | `GET /v1/nodes?limit=&cursor=` | fresh nodes, keyset-paginated composite cursor `<lastSeen>:<peerId>` |
 
 Every response carries `{ok, protocol: 1, ...}` and `heartbeatAfterSec`.
-The server slows the fleet's heartbeat cadence as it grows. That keeps D1
-write volume inside plan limits at 10k+ nodes.
+The service currently uses a fixed 30-minute heartbeat cadence. The
+`/v1/nodes` endpoint is queried directly from D1; add an edge-cache policy
+before relying on the scale figures below.
 
 ### Node records
 
@@ -64,10 +65,11 @@ Pagination uses `nextCursor` when more rows remain.
 
 ## Scale notes (1k to 10k nodes)
 
-- Writes are heartbeats only, with adaptive cadence (30 min default). 10k
-  nodes is about 480k writes/day, which fits Workers Paid D1 (25M/mo).
-  About 2k nodes fit free.
-- Reads are edge-cached and cursor-paginated. 10k rows is nothing for D1.
+- Writes are heartbeats only, with a fixed 30-minute cadence. 10k nodes is
+  about 480k writes/day, which fits Workers Paid D1 (25M/mo). About 2k nodes
+  fit free.
+- Reads are cursor-paginated but currently query D1 directly. Add edge
+  caching before treating this as a low-read-cost deployment.
 - Cron prunes expired nonces and 7-day-dead nodes twice an hour.
 
 ## Deploy

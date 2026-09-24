@@ -14,6 +14,9 @@ const DOMAIN = 'peers-directory';
 /** Ed25519 public key embedded in a PeerId string, or null when the id is
  * malformed / not an Ed25519 identity multihash. */
 export function pubkeyFromPeerId(peerId: string): Uint8Array | null {
+  // Base58 decoding is intentionally quadratic. Reject oversized input before
+  // it reaches the decoder so a public query cannot become a CPU amplifier.
+  if (typeof peerId !== 'string' || peerId.length === 0 || peerId.length > 128) return null;
   try {
     const mh = base58.decode(peerId);
     // 0x00 0x24 || protobuf(0x08 0x01 0x12 0x20 || key[32]) => 38 bytes
@@ -28,6 +31,7 @@ export function pubkeyFromPeerId(peerId: string): Uint8Array | null {
 
 /** Register proof binds the server-issued nonce to this exact peer id. */
 export function verifyRegister(peerId: string, nonce: string, sigB64: string): boolean {
+  if (nonce.length > 128 || sigB64.length > 256) return false;
   const key = pubkeyFromPeerId(peerId);
   if (!key) return false;
   try {
@@ -67,12 +71,33 @@ export function verifyHeartbeat(
  * what makes address poisoning infeasible. Accepts a comma-separated list
  * in PEERS_NODES format. */
 export function validMultiaddrs(addrs: unknown, peerId: string): addrs is string {
-  if (typeof addrs !== 'string' || addrs.length === 0) return false;
+  if (typeof addrs !== 'string' || addrs.length === 0 || addrs.length > 4096) return false;
   const parts = splitMultiaddrs(addrs);
-  if (parts.length === 0) return false;
-  return parts.every(
-    (a) => a.startsWith('/') && a.includes('/p2p/') && a.endsWith(`/p2p/${peerId}`),
-  );
+  if (parts.length === 0 || parts.length > 16) return false;
+  return parts.every((addr) => validMultiaddr(addr, peerId));
+}
+
+function validMultiaddr(addr: string, peerId: string): boolean {
+  if (addr.length > 512 || !addr.startsWith('/') || addr.endsWith('/') || addr.includes('//')) {
+    return false;
+  }
+
+  const p2p = '/p2p/';
+  const firstP2P = addr.indexOf(p2p);
+  if (firstP2P <= 0 || firstP2P !== addr.lastIndexOf(p2p)) return false;
+  if (addr.slice(firstP2P + p2p.length) !== peerId) return false;
+
+  const protocols = addr.slice(0, firstP2P).split('/').slice(1);
+  if (protocols.length < 3 || protocols.length > 4) return false;
+  if (!['ip4', 'ip6', 'dns4', 'dns6', 'dnsaddr'].includes(protocols[0])) return false;
+  if (protocols[1] !== 'tcp' && protocols[1] !== 'udp') return false;
+
+  const port = Number(protocols[2]);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return false;
+  if (protocols.length === 4 && !(protocols[1] === 'udp' && protocols[3] === 'quic-v1')) {
+    return false;
+  }
+  return true;
 }
 
 /** Splits a PEERS_NODES style comma-separated multiaddr list and trims
