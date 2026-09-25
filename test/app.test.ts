@@ -224,6 +224,50 @@ describe('directory flow', () => {
     expect(blocked.status).toBe(429);
   });
 
+  it('caps registrations per source IP independently of the peer limit', async () => {
+    // Each peer gets its own budget, so only the per-IP cap can stop this.
+    // The limit must sit below CHALLENGE_IP_LIMIT or the challenge cap would
+    // bind first and the register cap would be dead code.
+    const ipApp = createApp(new MemoryStore(), { now: clock });
+    const peerIds: string[] = [];
+    for (let i = 0; i < 60; i++) {
+      const peer = makePeer();
+      const ch = await json(
+        await ipApp.request(`/v1/challenge?peerId=${peer.peerId}`),
+      );
+      const response = await ipApp.request('/v1/register', {
+        method: 'POST',
+        headers: { 'cf-connecting-ip': '198.51.100.9' },
+        body: JSON.stringify({
+          peerId: peer.peerId,
+          nonce: ch.nonce,
+          sig: peer.sign(`peers-directory:v1:register:${peer.peerId}:${ch.nonce}`),
+          multiaddrs: `/ip4/203.0.113.7/tcp/4001/p2p/${peer.peerId}`,
+        }),
+      });
+      expect(response.status).toBe(200);
+      peerIds.push(peer.peerId);
+    }
+    // 61st distinct peer, same source: per-IP register cap must reject it.
+    const extra = makePeer();
+    const extraChallenge = await json(
+      await ipApp.request(`/v1/challenge?peerId=${extra.peerId}`),
+    );
+    const blocked = await ipApp.request('/v1/register', {
+      method: 'POST',
+      headers: { 'cf-connecting-ip': '198.51.100.9' },
+      body: JSON.stringify({
+        peerId: extra.peerId,
+        nonce: extraChallenge.nonce,
+        sig: extra.sign(
+          `peers-directory:v1:register:${extra.peerId}:${extraChallenge.nonce}`,
+        ),
+        multiaddrs: `/ip4/203.0.113.7/tcp/4001/p2p/${extra.peerId}`,
+      }),
+    });
+    expect(blocked.status).toBe(429);
+  });
+
   it('keeps healthz compatibility while exposing explicit node metrics', async () => {
     const store = new MemoryStore();
     const healthApp = createApp(store, { now: clock });

@@ -28,6 +28,11 @@ const RATE_WINDOW_MS = 60 * 60_000;
 const CHALLENGE_PEER_LIMIT = 20;
 const CHALLENGE_IP_LIMIT = 100;
 const REGISTER_PEER_LIMIT = 5;
+// Every register consumes a challenge nonce, so this must stay *below*
+// CHALLENGE_IP_LIMIT (100) or the challenge cap would always bind first and
+// this limit would be unreachable. 60/hour is the real per-source cap on D1
+// growth; challenges stay available for the rest of the budget.
+const REGISTER_IP_LIMIT = 60;
 const HEARTBEAT_PEER_LIMIT = 120;
 const HEARTBEAT_IP_LIMIT = 1_000;
 
@@ -115,6 +120,9 @@ export function createApp(store: RegistryStore, opts: AppOptions = {}): Hono {
       return json400(c, interval, 'multiaddrs must be comma-separated addrs ending in /p2p/<same peer id>');
     }
     if (!(await allow(store, `register:peer:${peerId}`, now(), RATE_WINDOW_MS, REGISTER_PEER_LIMIT))) {
+      return json429(c, interval);
+    }
+    if (!(await allow(store, `register:ip:${clientKey(c)}`, now(), RATE_WINDOW_MS, REGISTER_IP_LIMIT))) {
       return json429(c, interval);
     }
     if (!(await store.takeNonce(peerId, nonce, now()))) {
