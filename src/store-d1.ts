@@ -100,9 +100,36 @@ export class D1Store implements RegistryStore {
     return row?.n ?? 0;
   }
 
+  async countFresh(now: number, freshMs: number): Promise<number> {
+    const row = await this.db
+      .prepare("SELECT COUNT(*) AS n FROM nodes WHERE last_seen > ? AND tier != 'off'")
+      .bind(now - freshMs)
+      .first<{ n: number }>();
+    return row?.n ?? 0;
+  }
+
+  async allowRequest(key: string, now: number, windowMs: number, limit: number): Promise<boolean> {
+    const cutoff = now - windowMs;
+    const row = await this.db
+      .prepare(
+        'INSERT INTO rate_limits (key, window_start, request_count) VALUES (?, ?, 1) ' +
+          'ON CONFLICT(key) DO UPDATE SET ' +
+          'request_count = CASE WHEN rate_limits.window_start <= ? THEN 1 ELSE rate_limits.request_count + 1 END, ' +
+          'window_start = CASE WHEN rate_limits.window_start <= ? THEN excluded.window_start ELSE rate_limits.window_start END ' +
+          'RETURNING request_count',
+      )
+      .bind(key, now, cutoff, cutoff)
+      .first<{ request_count: number }>();
+    return (row?.request_count ?? limit + 1) <= limit;
+  }
+
   async prune(now: number, nodeTtlMs: number): Promise<void> {
     await this.db.prepare('DELETE FROM nonces WHERE expires_at <= ?').bind(now).run();
     await this.db.prepare('DELETE FROM nodes WHERE last_seen <= ?').bind(now - nodeTtlMs).run();
+    await this.db
+      .prepare('DELETE FROM rate_limits WHERE window_start <= ?')
+      .bind(now - 24 * 60 * 60_000)
+      .run();
   }
 }
 

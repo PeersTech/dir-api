@@ -31,6 +31,10 @@ export interface RegistryStore {
     cursor?: { lastSeen: number; peerId: string },
   ): Promise<NodeRow[]>;
   count(): Promise<number>;
+  /** Counts nodes that satisfy the same freshness and tier rules as listFresh. */
+  countFresh?(now: number, freshMs: number): Promise<number>;
+  /** Shared fixed-window request limiter. Production uses D1, tests can use memory. */
+  allowRequest(key: string, now: number, windowMs: number, limit: number): Promise<boolean>;
   /** Deletes expired nonces and nodes unseen past nodeTtlMs. */
   prune(now: number, nodeTtlMs: number): Promise<void>;
 }

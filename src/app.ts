@@ -22,6 +22,14 @@ export interface AppOptions {
 }
 
 const DEFAULTS = { heartbeatAfterSec: 1800, freshMs: 900_000, skewMs: 900_000 };
+/** Leave room for the protocol fields while keeping the D1 write path small. */
+const MAX_JSON_BODY_BYTES = 16 * 1024;
+const RATE_WINDOW_MS = 60 * 60_000;
+const CHALLENGE_PEER_LIMIT = 20;
+const CHALLENGE_IP_LIMIT = 100;
+const REGISTER_PEER_LIMIT = 5;
+const HEARTBEAT_PEER_LIMIT = 120;
+const HEARTBEAT_IP_LIMIT = 1_000;
 
 export function createApp(store: RegistryStore, opts: AppOptions = {}): Hono {
   const now = opts.now ?? (() => Date.now());
@@ -41,14 +49,37 @@ export function createApp(store: RegistryStore, opts: AppOptions = {}): Hono {
     ),
   );
 
-  app.get('/healthz', async (c) =>
-    c.json({ ok: true, protocol: 1, heartbeatAfterSec: interval, nodes: await store.count() }),
-  );
+  app.get('/healthz', async (c) => {
+    const registeredNodes = await store.count();
+    // `nodes` is retained as the legacy total. `metrics.freshNodes` has a
+    // deliberately narrower meaning: it is the number of nodes currently
+    // eligible for discovery, using the same freshness window and tier rule
+    // as /v1/nodes.
+    const freshNodes = store.countFresh
+      ? await store.countFresh(now(), (opts.freshMs ?? DEFAULTS.freshMs) * 2)
+      : null;
+    return c.json({
+      ok: true,
+      protocol: 1,
+      heartbeatAfterSec: interval,
+      nodes: registeredNodes,
+      metrics: {
+        registeredNodes,
+        ...(freshNodes === null ? {} : { freshNodes }),
+      },
+    });
+  });
 
   app.get('/v1/challenge', async (c) => {
     const peerId = c.req.query('peerId') ?? '';
     if (!pubkeyFromPeerId(peerId)) {
       return json400(c, interval, 'malformed peer id');
+    }
+    if (!(await allow(store, `challenge:peer:${peerId}`, now(), RATE_WINDOW_MS, CHALLENGE_PEER_LIMIT))) {
+      return json429(c, interval);
+    }
+    if (!(await allow(store, `challenge:ip:${clientKey(c)}`, now(), RATE_WINDOW_MS, CHALLENGE_IP_LIMIT))) {
+      return json429(c, interval);
     }
     const nonce = crypto.randomUUID().replaceAll('-', '');
     const activeNonce = await store.putNonce(peerId, nonce, now() + 5 * 60_000, now());
@@ -56,11 +87,25 @@ export function createApp(store: RegistryStore, opts: AppOptions = {}): Hono {
   });
 
   app.post('/v1/register', async (c) => {
-    const body = (await c.req.json().catch(() => null)) as null | Record<string, unknown>;
-    if (!body) return json400(c, interval, 'body must be json');
-    const { peerId, nonce, sig, multiaddrs } = body as Record<string, string>;
-    if (!peerId || !nonce || !sig) return json400(c, interval, 'peerId, nonce, sig required');
-    if (!verifyRegister(peerId, String(nonce), String(sig))) {
+    const parsed = await parseJsonObject(c, interval);
+    if (!parsed.ok) return parsed.response;
+    const body = parsed.body;
+    if (!hasOnlyFields(body, ['peerId', 'nonce', 'sig', 'multiaddrs', 'tier', 'region'])) {
+      return json400(c, interval, 'body contains an unsupported field');
+    }
+    const { peerId, nonce, sig, multiaddrs } = body;
+    if (
+      typeof peerId !== 'string' ||
+      typeof nonce !== 'string' ||
+      typeof sig !== 'string' ||
+      typeof multiaddrs !== 'string'
+    ) {
+      return json400(c, interval, 'peerId, nonce, sig, and multiaddrs must be strings');
+    }
+    if (body.region !== undefined && body.region !== null && !validRegion(body.region)) {
+      return json400(c, interval, 'region must be a string no longer than 32 characters');
+    }
+    if (!verifyRegister(peerId, nonce, sig)) {
       return json400(c, interval, 'signature invalid');
     }
     // Fail fast on a bad tier before consuming the single-use nonce.
@@ -69,7 +114,10 @@ export function createApp(store: RegistryStore, opts: AppOptions = {}): Hono {
     if (!validMultiaddrs(multiaddrs, peerId)) {
       return json400(c, interval, 'multiaddrs must be comma-separated addrs ending in /p2p/<same peer id>');
     }
-    if (!(await store.takeNonce(peerId, String(nonce), now()))) {
+    if (!(await allow(store, `register:peer:${peerId}`, now(), RATE_WINDOW_MS, REGISTER_PEER_LIMIT))) {
+      return json429(c, interval);
+    }
+    if (!(await store.takeNonce(peerId, nonce, now()))) {
       return json400(c, interval, 'nonce unknown, expired or already used');
     }
     await store.upsertNode({
@@ -83,14 +131,32 @@ export function createApp(store: RegistryStore, opts: AppOptions = {}): Hono {
   });
 
   app.post('/v1/heartbeat', async (c) => {
-    const body = (await c.req.json().catch(() => null)) as null | Record<string, unknown>;
-    if (!body) return json400(c, interval, 'body must be json');
-    const { peerId, ts, sig, multiaddrs, region } = body as Record<string, unknown>;
+    const parsed = await parseJsonObject(c, interval);
+    if (!parsed.ok) return parsed.response;
+    const body = parsed.body;
+    if (!hasOnlyFields(body, ['peerId', 'ts', 'sig', 'multiaddrs', 'region', 'tier'])) {
+      return json400(c, interval, 'body contains an unsupported field');
+    }
+    const { peerId, ts, sig, multiaddrs, region } = body;
+    if (
+      typeof peerId !== 'string' ||
+      typeof ts !== 'number' ||
+      !Number.isSafeInteger(ts) ||
+      typeof sig !== 'string'
+    ) {
+      return json400(c, interval, 'peerId, ts, and sig have invalid types');
+    }
+    if (multiaddrs !== undefined && typeof multiaddrs !== 'string') {
+      return json400(c, interval, 'multiaddrs must be a string');
+    }
+    if (region !== undefined && region !== null && !validRegion(region)) {
+      return json400(c, interval, 'region must be a string no longer than 32 characters');
+    }
     if (
       !verifyHeartbeat(
-        String(peerId),
-        Number(ts),
-        String(sig),
+        peerId,
+        ts,
+        sig,
         now(),
         opts.skewMs ?? DEFAULTS.skewMs,
       )
@@ -99,10 +165,13 @@ export function createApp(store: RegistryStore, opts: AppOptions = {}): Hono {
     }
     const hbTier = parseTier(body.tier);
     if (!hbTier.ok) return json400(c, interval, 'tier must be citizen, node, or off');
-    const peerIdString = String(peerId);
-    if (region !== undefined && region !== null && (typeof region !== 'string' || region.length > 32)) {
-      return json400(c, interval, 'region must be a string no longer than 32 characters');
+    if (!(await allow(store, `heartbeat:peer:${peerId}`, now(), RATE_WINDOW_MS, HEARTBEAT_PEER_LIMIT))) {
+      return json429(c, interval);
     }
+    if (!(await allow(store, `heartbeat:ip:${clientKey(c)}`, now(), RATE_WINDOW_MS, HEARTBEAT_IP_LIMIT))) {
+      return json429(c, interval);
+    }
+    const peerIdString = peerId;
     const existing = await store.getNode(peerIdString);
     if (multiaddrs !== undefined && !validMultiaddrs(multiaddrs, peerIdString)) {
       return json400(c, interval, 'multiaddrs must be comma-separated addrs ending in /p2p/<same peer id>');
@@ -198,6 +267,100 @@ function decodeCursor(raw: string | undefined): { lastSeen: number; peerId: stri
     return undefined;
   }
   return { lastSeen, peerId };
+}
+
+type ParsedJsonObject =
+  | { ok: true; body: Record<string, unknown> }
+  | { ok: false; response: Response };
+
+/** Read at most MAX_JSON_BODY_BYTES and require a plain JSON object. The
+ * stream limit is important: checking Content-Length alone would allow a
+ * chunked request to bypass the limit. */
+async function parseJsonObject(c: Context, heartbeatAfterSec: number): Promise<ParsedJsonObject> {
+  const contentLength = c.req.raw.headers.get('content-length');
+  if (contentLength !== null) {
+    if (!/^\d+$/.test(contentLength)) {
+      return { ok: false, response: json400(c, heartbeatAfterSec, 'invalid content-length') };
+    }
+    if (Number(contentLength) > MAX_JSON_BODY_BYTES) {
+      return { ok: false, response: jsonBodyTooLarge(c, heartbeatAfterSec) };
+    }
+  }
+
+  if (!c.req.raw.body) {
+    return { ok: false, response: json400(c, heartbeatAfterSec, 'body must be json') };
+  }
+  const reader = c.req.raw.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MAX_JSON_BODY_BYTES) {
+        await reader.cancel().catch(() => undefined);
+        return { ok: false, response: jsonBodyTooLarge(c, heartbeatAfterSec) };
+      }
+      chunks.push(value);
+    }
+  } catch {
+    return { ok: false, response: json400(c, heartbeatAfterSec, 'body must be json') };
+  }
+
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(bytes));
+  } catch {
+    return { ok: false, response: json400(c, heartbeatAfterSec, 'body must be json') };
+  }
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return { ok: false, response: json400(c, heartbeatAfterSec, 'body must be a json object') };
+  }
+  return { ok: true, body: value as Record<string, unknown> };
+}
+
+function hasOnlyFields(body: Record<string, unknown>, fields: string[]): boolean {
+  const allowed = new Set(fields);
+  return Object.keys(body).every((field) => allowed.has(field));
+}
+
+function validRegion(value: unknown): value is string {
+  return typeof value === 'string' && value.length <= 32;
+}
+
+function jsonBodyTooLarge(c: Context, heartbeatAfterSec: number): Response {
+  return c.json(
+    { ok: false, protocol: 1, heartbeatAfterSec, error: 'request body too large' },
+    413,
+  );
+}
+
+async function allow(
+  store: RegistryStore,
+  key: string,
+  now: number,
+  windowMs: number,
+  limit: number,
+): Promise<boolean> {
+  return store.allowRequest(key, now, windowMs, limit);
+}
+
+function clientKey(c: Context): string {
+  return c.req.header('cf-connecting-ip')?.slice(0, 64) || 'unknown';
+}
+
+function json429(c: Context, heartbeatAfterSec: number): Response {
+  return c.json(
+    { ok: false, protocol: 1, heartbeatAfterSec, error: 'rate limit exceeded' },
+    429,
+  );
 }
 
 function json400(c: Context, heartbeatAfterSec: number, error: string) {

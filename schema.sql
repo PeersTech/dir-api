@@ -9,6 +9,12 @@ CREATE TABLE IF NOT EXISTS nodes (
 );
 CREATE INDEX IF NOT EXISTS idx_nodes_last_seen ON nodes(last_seen);
 
+CREATE TABLE IF NOT EXISTS rate_limits (
+  key          TEXT PRIMARY KEY,
+  window_start INTEGER NOT NULL,
+  request_count INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS nonces (
   peer_id    TEXT PRIMARY KEY,
   nonce      TEXT NOT NULL,

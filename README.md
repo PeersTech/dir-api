@@ -20,14 +20,31 @@ domain. The zone peers.dpdns.org is on Cloudflare).
 | Endpoint | Purpose |
 |---|---|
 | `GET /v1/challenge?peerId=` | single-use nonce, 5 min TTL |
-| `POST /v1/register` | `{peerId, nonce, sig, multiaddrs}` where `multiaddrs` is a comma-separated list in `PEERS_NODES` format. Sig over `peers-directory:v1:register:<peerId>:<nonce>` |
-| `POST /v1/heartbeat` | `{peerId, ts, sig[, multiaddrs][, tier]}` every `heartbeatAfterSec`. Inside half the cadence it is a free ack (write-skipped) |
+| `POST /v1/register` | `{peerId, nonce, sig, multiaddrs[, region][, tier]}` where `multiaddrs` is a comma-separated list in `PEERS_NODES` format. Sig over `peers-directory:v1:register:<peerId>:<nonce>` |
+| `POST /v1/heartbeat` | `{peerId, ts, sig[, multiaddrs][, region][, tier]}` every `heartbeatAfterSec`. `ts` is a JSON number. Inside half the cadence it is a free ack (write-skipped) |
 | `GET /v1/nodes?limit=&cursor=` | fresh nodes, keyset-paginated composite cursor `<lastSeen>:<peerId>` |
+| `GET /healthz` | liveness plus registry counts; see the metric definitions below |
 
 Every response carries `{ok, protocol: 1, ...}` and `heartbeatAfterSec`.
-The service currently uses a fixed 30-minute heartbeat cadence. The
-`/v1/nodes` endpoint is queried directly from D1; add an edge-cache policy
-before relying on the scale figures below.
+POST bodies must be plain JSON objects, contain only documented fields, and be
+at most 16 KiB. The limit is enforced while streaming the request, so a
+missing or dishonest `Content-Length` cannot bypass it; oversized bodies return
+413. Public write routes also use D1-backed fixed-window limits: challenge,
+registration, and heartbeat requests are limited by peer and source IP. The
+service currently uses a fixed 30-minute heartbeat cadence. The `/v1/nodes`
+endpoint is queried directly from D1; add an edge-cache policy before relying
+on the scale figures below.
+
+### /healthz metrics
+
+`nodes` remains the legacy total number of rows for compatibility. The
+`metrics` object makes the meanings explicit:
+
+- `metrics.registeredNodes`: all stored rows, including stale nodes and nodes
+  whose tier is `off`.
+- `metrics.freshNodes`: non-`off` rows currently eligible for `/v1/nodes`
+  (`last_seen > now - 2 * freshMs`). It is the useful discovery-health
+  number, not a request-rate or abuse metric.
 
 ### Node records
 
@@ -64,6 +81,38 @@ Pagination uses `nextCursor` when more rows remain.
 - Clients still dial and verify locally. A hostile directory can degrade
   onboarding. It cannot read traffic (there is none) or redirect messages.
 
+## Replay and signed metadata (v2 design)
+
+The v1 register nonce is durable and single-use in D1. A v1 heartbeat is
+Ed25519-authenticated and time-bounded, but it is **not** a durable
+anti-replay protocol: the same valid signature can be replayed while its
+timestamp is inside the allowed clock-skew window. The API does apply
+D1-backed fixed-window abuse limits, but those limits are not message replay
+protection.
+
+The safest practical follow-up is a backwards-compatible v2 metadata path:
+
+1. Sign a canonical, versioned payload containing the peer id, request kind,
+   server-issued nonce or monotonic sequence, timestamp, and the exact
+   multiaddrs/region/tier metadata. Canonicalization must be specified and
+   identical on client and server; do not sign an ambiguously ordered JSON
+   string.
+2. Atomically insert a bounded replay key `(peer_id, key, expires_at)` before
+   applying the update. A unique D1 key and an insert-or-ignore/returning
+   operation make concurrent requests for the same signature resolve to one
+   winner. Expire and prune replay keys with the existing scheduled job.
+3. Keep v1 endpoints as-is for compatibility, and make v2 opt-in until clients
+   can sign the canonical payload. For mutable metadata, consume a fresh
+   server nonce and reject an older sequence/snapshot; a heartbeat timestamp
+   alone is not enough.
+4. Apply abuse throttling at the Cloudflare edge (or another real shared
+   primitive), based on an explicit policy. Do not add an in-memory Worker
+   counter and call it a rate limiter.
+
+This design is intentionally documented rather than partially implemented in
+v1: accepting unsigned or ambiguously canonical metadata now would weaken the
+existing trust model.
+
 ## Scale notes (1k to 10k nodes)
 
 - Writes are heartbeats only, with a fixed 30-minute cadence. 10k nodes is
@@ -71,7 +120,7 @@ Pagination uses `nextCursor` when more rows remain.
   fit free.
 - Reads are cursor-paginated but currently query D1 directly. Add edge
   caching before treating this as a low-read-cost deployment.
-- Cron prunes expired nonces and 7-day-dead nodes twice an hour.
+- Cron prunes expired nonces, stale rate-limit windows, and 7-day-dead nodes twice an hour.
 
 ## Deploy
 

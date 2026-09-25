@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { ed25519 } from '@noble/curves/ed25519.js';
+import { validMultiaddrs } from '../src/crypto.js';
 import { createApp } from '../src/app.js';
 import type { NodeRow, RegistryStore } from '../src/types.js';
 
@@ -16,6 +17,7 @@ const advance = (ms: number) => (t += ms);
 class MemoryStore implements RegistryStore {
   nodes = new Map<string, NodeRow>();
   nonces = new Map<string, { nonce: string; expiresAt: number }>();
+  limits = new Map<string, { windowStart: number; count: number }>();
 
   async putNonce(p: string, n: string, exp: number, now: number) {
     const existing = this.nonces.get(p);
@@ -58,6 +60,21 @@ class MemoryStore implements RegistryStore {
   }
   async count() {
     return this.nodes.size;
+  }
+  async countFresh(now: number, freshMs: number) {
+    return [...this.nodes.values()].filter(
+      (n) => n.lastSeen > now - freshMs && n.tier !== 'off',
+    ).length;
+  }
+  async allowRequest(key: string, now: number, windowMs: number, limit: number) {
+    const current = this.limits.get(key);
+    if (!current || now - current.windowStart >= windowMs) {
+      this.limits.set(key, { windowStart: now, count: 1 });
+      return true;
+    }
+    if (current.count >= limit) return false;
+    current.count += 1;
+    return true;
   }
   async prune(_now: number, _ttl: number) {}
 }
@@ -122,6 +139,37 @@ async function register(peer: ReturnType<typeof makePeer>, addr?: string): Promi
   );
 }
 
+describe('multiaddr validation', () => {
+  it('accepts TCP, QUIC-v1, IPv6, DNS, and dnsaddr transports', () => {
+    const p = makePeer();
+    const id = p.peerId;
+    const valid = [
+      `/ip4/203.0.113.7/tcp/4001/p2p/${id}`,
+      `/ip4/203.0.113.7/udp/4001/quic-v1/p2p/${id}`,
+      `/ip6/2001:db8::1/udp/4001/quic-v1/p2p/${id}`,
+      `/dns4/node.example.com/tcp/4001/p2p/${id}`,
+      `/dnsaddr/bootstrap.libp2p.io/p2p/${id}`,
+    ];
+    expect(validMultiaddrs(valid.join(','), id)).toBe(true);
+  });
+
+  it('rejects malformed transports and ambiguous peer suffixes', () => {
+    const p = makePeer();
+    const id = p.peerId;
+    const invalid = [
+      `/ip4/203.0.113.7/tcp/4001/quic-v1/p2p/${id}`,
+      `/ip4/203.0.113.7/tcp/0/p2p/${id}`,
+      `/ip4/203.0.113.7/tcp/65536/p2p/${id}`,
+      `/ip4/203.0.113.7/udp/not-a-port/quic-v1/p2p/${id}`,
+      `/ip4/999.0.0.1/tcp/4001/p2p/${id}`,
+      `/ip4/203.0.113.7/tcp/4001/p2p/${id}/extra`,
+      `/ip4/203.0.113.7/tcp/4001/p2p/${id}/p2p/${id}`,
+      `/dns4/-bad.example/tcp/4001/p2p/${id}`,
+    ];
+    for (const addr of invalid) expect(validMultiaddrs(addr, id)).toBe(false);
+  });
+});
+
 // --- tests ------------------------------------------------------------------
 
 describe('directory flow', () => {
@@ -131,6 +179,78 @@ describe('directory flow', () => {
     expect(res.ok).toBe(true);
     expect(res.heartbeatAfterSec).toBeGreaterThan(0);
     expect(await app.request('/healthz')).toBeTruthy();
+  });
+
+  it('registers the QUIC-v1 address advertised by Peers', async () => {
+    const p = makePeer();
+    const res = await register(p, `/ip4/203.0.113.7/udp/4001/quic-v1/p2p/${p.peerId}`);
+    expect(res.ok).toBe(true);
+  });
+
+  it('rejects non-object, wrong-typed, and oversized request bodies', async () => {
+    const arrayBody = await app.request('/v1/register', {
+      method: 'POST',
+      body: JSON.stringify([]),
+    });
+    expect(arrayBody.status).toBe(400);
+
+    const wrongType = await app.request('/v1/register', {
+      method: 'POST',
+      body: JSON.stringify({ peerId: 1, nonce: 2, sig: 3, multiaddrs: 4 }),
+    });
+    expect(wrongType.status).toBe(400);
+
+    const malformed = await app.request('/v1/register', {
+      method: 'POST',
+      body: '{',
+    });
+    expect(malformed.status).toBe(400);
+
+    const oversized = await app.request('/v1/register', {
+      method: 'POST',
+      body: JSON.stringify({ padding: 'x'.repeat(17_000) }),
+    });
+    expect(oversized.status).toBe(413);
+  });
+
+  it('rate limits repeated challenge requests', async () => {
+    const limitedApp = createApp(new MemoryStore(), { now: clock });
+    const peer = makePeer();
+    for (let i = 0; i < 20; i++) {
+      const response = await limitedApp.request(`/v1/challenge?peerId=${peer.peerId}`);
+      expect(response.status).toBe(200);
+    }
+    const blocked = await limitedApp.request(`/v1/challenge?peerId=${peer.peerId}`);
+    expect(blocked.status).toBe(429);
+  });
+
+  it('keeps healthz compatibility while exposing explicit node metrics', async () => {
+    const store = new MemoryStore();
+    const healthApp = createApp(store, { now: clock });
+    await store.upsertNode({
+      peerId: makePeer().peerId,
+      multiaddrs: '/ip4/203.0.113.7/tcp/4001/p2p/fixture',
+      region: null,
+      tier: 'node',
+      lastSeen: clock(),
+    });
+    await store.upsertNode({
+      peerId: makePeer().peerId,
+      multiaddrs: 'off-fixture',
+      region: null,
+      tier: 'off',
+      lastSeen: clock(),
+    });
+    await store.upsertNode({
+      peerId: makePeer().peerId,
+      multiaddrs: 'stale-fixture',
+      region: null,
+      tier: 'node',
+      lastSeen: clock() - 1_800_001,
+    });
+    const health = await json(await healthApp.request('/healthz'));
+    expect(health.nodes).toBe(3);
+    expect(health.metrics).toEqual({ registeredNodes: 3, freshNodes: 1 });
   });
 
   it('rejects a signature made by a different key than the id embeds', async () => {
