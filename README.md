@@ -71,6 +71,14 @@ The list response includes both shapes:
 
 Pagination uses `nextCursor` when more rows remain.
 
+## Message and attachment boundary
+
+The Directory API is a node registry only. It does not store, proxy, validate,
+or deliver DMs, group DMs, message actions, or attachment bytes. A client uses
+`peersNodes` only as a source of relay candidates, then performs peer identity
+verification and P2P messaging itself. Group-DM membership and attachment
+privacy belong to the Peers protocol, not to this service.
+
 ## Trust model
 
 - A libp2p peer id embeds its own Ed25519 public key. Every request is
